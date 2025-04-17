@@ -19,8 +19,10 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.custom_op import CustomOp
+from sglang.srt.custom_op import CustomOp, _is_hip
 from sglang.srt.utils import is_cuda_available
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda_available()
 
@@ -32,9 +34,20 @@ if _is_cuda:
         rmsnorm,
     )
 
+if _is_hip:
+    import aiter as _rocm_aiter
 
-logger = logging.getLogger(__name__)
+    def rocm_aiter_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:  # noqa: N802
+        return _rocm_aiter.rms_norm(x, w, eps)
 
+    def rocm_aiter_fused_add_rms_norm(  # noqa: N802
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _rocm_aiter.rmsnorm2d_fwd_with_add(x, x, residual, residual, w, eps)
+        return x, residual
 
 class RMSNorm(CustomOp):
     def __init__(
@@ -51,6 +64,12 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _is_hip:
+            if residual is not None:
+                return rocm_aiter_fused_add_rms_norm(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+            return rocm_aiter_rms_norm(x, self.weight.data, self.variance_epsilon)
 
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
@@ -139,7 +158,7 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not _is_cuda:
+if not (_is_cuda or _is_hip):
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
